@@ -1,0 +1,59 @@
+{
+  "name": "logroller",
+  "version": "1.0.0",
+  "description": "Zero-dependency rotating file stream for Node.js — daily/interval/size rotation, gzip archives, retention, timezone-aware, crash-safe resume",
+  "license": "MIT",
+  "author": "Vinau <>",
+  "homepage": "https://github.com/VinniWin/logroller#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VinniWin/logroller.git"
+  },
+  "bugs": "https://github.com/VinniWin/logroller/issues",
+  "keywords": [
+    "log",
+    "logger",
+    "rotate",
+    "rotation",
+    "rotating-file",
+    "gzip",
+    "stream",
+    "daily-rotate",
+    "logrotate",
+    "writable"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.esm.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.esm.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=16.4"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json && rollup -c",
+    "test": "npm run build && node --test --experimental-strip-types test/rotate.test.ts",
+    "prepublishOnly": "npm test && npm run build",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@rollup/plugin-typescript": "^11.1.6",
+    "@types/node": "^22.10.0",
+    "rollup": "^4.27.0",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "tslib": "^2.8.1"
+  }
+}
