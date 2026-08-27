@@ -1,9 +1,9 @@
 {
   "name": "logroller",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Zero-dependency rotating file stream for Node.js — daily/interval/size rotation, gzip archives, retention, timezone-aware, crash-safe resume",
   "license": "MIT",
-  "author": "Vinau <>",
+  "author": "Vinau",
   "homepage": "https://github.com/VinniWin/logroller#readme",
   "repository": {
     "type": "git",
@@ -13,47 +13,63 @@
   "keywords": [
     "log",
     "logger",
+    "logging",
     "rotate",
     "rotation",
     "rotating-file",
+    "rolling",
     "gzip",
+    "compress",
+    "retention",
     "stream",
+    "writable",
     "daily-rotate",
     "logrotate",
-    "writable"
+    "timezone",
+    "utc",
+    "pino",
+    "pipeline",
+    "crash-safe",
+    "resilient",
+    "zero-dependency"
   ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.esm.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.esm.js",
       "require": "./dist/index.cjs"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=16.4"
+    "node": ">=16.14"
   },
   "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.json && rollup -c",
-    "test": "npm run build && node --test --experimental-strip-types test/rotate.test.ts",
-    "prepublishOnly": "npm test && npm run build",
-    "prepare": "npm run build"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.js\"",
+    "test": "node --test --experimental-strip-types test/rotate.test.ts",
+    "verify": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run verify",
+    "release": "npm run verify && npm pack --dry-run"
   },
   "devDependencies": {
     "@rollup/plugin-typescript": "^11.1.6",
-    "@types/node": "^22.10.0",
-    "rollup": "^4.27.0",
-    "typescript": "^5.6.3"
-  },
-  "dependencies": {
-    "tslib": "^2.8.1"
+    "@types/node": "^26.4.0",
+    "prettier": "^3.4.2",
+    "rollup": "^4.28.1",
+    "tslib": "^2.8.1",
+    "typescript": "^5.7.2"
   }
 }

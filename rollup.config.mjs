@@ -12,7 +12,6 @@ export default {
   plugins: [
     typescript({
       tsconfig: "./tsconfig.json",
-      // bundles emit JS here; the standalone `tsc` step emits the .d.ts
       declaration: false,
       declarationMap: false,
       emitDeclarationOnly: false,
