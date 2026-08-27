@@ -25,12 +25,13 @@ import type {
     RotateFileStreamEventMap,
     RotateFileStreamOptions,
     RotationReason
-} from "./types";
+} from "./types.js";
 
 const BUMP_DEFAULT_MS = 60_000;
 const AUDIT_MAX_FILES = 600;
 const AUDIT_MAX_EVENTS = 200;
 const HEARTBEAT_STALE_MS = 30_000;
+const TIMER_POLL_MS = 1_000;
 
 type FileState =
     | "active"
@@ -136,8 +137,8 @@ export class RotateFileStream extends Writable {
 
     /* ---- virtual test clock ---- */
     private _offsetMs: number;
-    private readonly _stepMs: number;
-    private readonly _bumpEvery: number;
+    private _stepMs: number;
+    private _bumpEvery: number;
 
     /* ---- live state ---- */
     private _curStamp: string;
@@ -149,6 +150,7 @@ export class RotateFileStream extends Writable {
     private _bumpTimer: NodeJS.Timeout | null = null;
     private _ended = false;
     private _tail: Promise<unknown> = Promise.resolve();
+    private _warnedBackward = false;
     private _audit: AuditDoc;
 
     constructor(opts: Partial<RotateFileStreamOptions> = {}) {
@@ -220,14 +222,32 @@ export class RotateFileStream extends Writable {
             );
         }
 
+
+        process.nextTick(() => {
+            const warn = (m: string) => this.emit("warn", new Error(m));
+            if (this.freq.type === "interval") {
+                if (this.freq.ms < 86_400_000 && !this.datePattern.includes("HH")) {
+                    warn(
+                        `frequency "${opts.frequency}" needs HH in datePattern — ` +
+                        "segments would collapse onto one filename",
+                    );
+                }
+                if (this.freq.ms < 60_000 && !this.datePattern.includes("mm")) {
+                    warn(`frequency "${opts.frequency}" needs mm in datePattern`);
+                }
+            } else if (!this.datePattern.includes("DD")) {
+                warn("daily frequency needs DD in datePattern");
+            }
+        });
+
         /* Boot housekeeping is job #1 of the serial queue — chained HERE in the
            constructor so it deterministically precedes any write job: zombie
            demotion sees `_path === null`, gzip repair cannot race a reopen.  */
         this._job(async () => {
+            await this._sealOrphanedPastStamps();
             if (this._auditEnabled) {
                 this._demoteZombieActives();
                 this._reconcileWithDisk();
-                await this._sealOrphanedPastStamps();   
                 await this._repairInterruptedGzips();
                 this._aevent("boot", { stamp: this._curStamp, index: this._index });
                 this._saveAudit();
@@ -246,7 +266,6 @@ export class RotateFileStream extends Writable {
     /* ==================================================================
      * Typed events — tuple map overloads FIRST, Node-core-compatible
      * fallback SECOND (keeps `.pipe()` structural typing intact).
-     * Implementations simply delegate to the parent EventEmitter.
      * ================================================================ */
 
     override on<E extends keyof RotateFileStreamEventMap>(
@@ -290,9 +309,7 @@ export class RotateFileStream extends Writable {
         return this._index;
     }
 
-    /**
-     * Force an immediate rotation and resolve when the next slot is staged.
-     */
+    /** Force an immediate rotation and resolve when the next slot is staged. */
     rotateNow(): Promise<void> {
         return this._job(() => this._rotate("manual"));
     }
@@ -323,8 +340,8 @@ export class RotateFileStream extends Writable {
 
         this._job(async () => {
             try {
-                const stamp = this._stampNow();
-                if (stamp !== this._curStamp) await this._rotate("time");
+                // guarded roll (never rotates into a regressed stamp)
+                if (this._stampAdvanced(this._stampNow())) await this._rotate("time");
 
                 await this._ensureOpen();
 
@@ -408,6 +425,27 @@ export class RotateFileStream extends Writable {
     }
 
     /**
+     * true only when the period legally advanced. A regressed
+     * clock (NTP correction, manual change) never reopens a past family:
+     * writes continue in the current segment until real time catches up.
+     * Requires zero-padded datePattern tokens (documented assumption).
+     */
+    private _stampAdvanced(stamp: string): boolean {
+        if (stamp > this._curStamp) return true;
+        if (stamp < this._curStamp && !this._warnedBackward) {
+            this._warnedBackward = true;
+            this.emit(
+                "warn",
+                new Error(
+                    `clock moved backward (stamp ${stamp} < ${this._curStamp}); ` +
+                    "keeping current segment until the clock catches up",
+                ),
+            );
+        }
+        return false;
+    }
+
+    /**
      * Highest viable segment index for `stamp`.
      * Disk is truth: resume a raw tail; start after sealed ones.
      * The audit pointer (same stamp only) may only RAISE the result.
@@ -449,6 +487,9 @@ export class RotateFileStream extends Writable {
 
         if (this._auditEnabled) {
             const base = path.basename(p);
+            // reopen = NEW incarnation. Never inherit lifecycle
+            // fields from the previous record (observed in the wild as
+            // abandonedAt < openedAt on reactivated segments).
             this._audit.files[base] = {
                 index: this._index,
                 state: "active",
@@ -501,49 +542,73 @@ export class RotateFileStream extends Writable {
                     archive = null;
                 }
             } else if (realBytes === 0) {
+                // a concurrent writer may have archived this segment
+                // between our last stat and now — adopt its artifact instead of
+                // recording a false `drop-empty` that orphans the .gz.
                 const adoptedGz = `${oldPath}.gz`;
                 if (existsSafe(adoptedGz)) {
-                    // A concurrent writer archived this segment between our last stat
-                    // and now — adopt its artifact instead of dropping the record.
                     this._finishArchivedRecord(oldBase);
                     archive = adoptedGz;
                 } else {
-                    try { fs.unlinkSync(oldPath); } catch { /* already gone */ }
+                    try {
+                        fs.unlinkSync(oldPath);
+                    } catch {
+                        /* already gone */
+                    }
                     if (rec) delete this._audit.files[oldBase];
                     this._aevent("drop-empty", { file: oldBase });
                 }
+            } else if (rec) {
+                rec.state = "sealed";
+                rec.bytes = realBytes;
             }
-
-            const stamp = this._stampNow();
-            const newPeriod = stamp !== this._curStamp;
-            this._curStamp = stamp;
-            /* Never blind-reset to 0 — recover what THIS stamp already owns. */
-            this._index =
-                newPeriod || kind === "time"
-                    ? this._recoverIndexFor(stamp)
-                    : this._index + 1;
-            this._bytes = 0;
-
-            if (this._auditEnabled) {
-                this._setActivePointer(this._index);
-                this._aevent("rotate", { reason: kind, nextIndex: this._index, stamp });
-                this._saveAudit();
-            }
-
-            if (kind === "time" || kind === "manual") this._armTimer();
-
-            if (oldPath) {
-                this.emit("rotated", {
-                    reason: kind,
-                    oldFile: oldPath,
-                    archive,
-                    newFile: this._resolveName(stamp, this._index),
-                });
-            }
-
-            this._retire();
         }
+
+        let stamp = this._stampNow();
+        // a rotation itself must never move the series backward
+        // (covers rotateNow()/interval/size paths the upstream guards miss)
+        if (stamp < this._curStamp) {
+            if (!this._warnedBackward) {
+                this._warnedBackward = true;
+                this.emit(
+                    "warn",
+                    new Error(
+                        `clock moved backward (stamp ${stamp} < ${this._curStamp}); ` +
+                        "rotation clamped to the current period",
+                    ),
+                );
+            }
+            stamp = this._curStamp;
+        }
+        const newPeriod = stamp !== this._curStamp;
+        this._curStamp = stamp;
+        /* Never blind-reset to 0 — recover what THIS stamp already owns. */
+        this._index =
+            newPeriod || kind === "time"
+                ? this._recoverIndexFor(stamp)
+                : this._index + 1;
+        this._bytes = 0;
+
+        if (this._auditEnabled) {
+            this._setActivePointer(this._index);
+            this._aevent("rotate", { reason: kind, nextIndex: this._index, stamp });
+            this._saveAudit();
+        }
+
+        if (kind === "time" || kind === "manual") this._armTimer();
+
+        if (oldPath) {
+            this.emit("rotated", {
+                reason: kind,
+                oldFile: oldPath,
+                archive,
+                newFile: this._resolveName(stamp, this._index),
+            });
+        }
+
+        this._retire();
     }
+
     /* ==================================================================
      * Timers
      * ================================================================ */
@@ -563,16 +628,26 @@ export class RotateFileStream extends Writable {
                 ? nextMidnight(this.tz, now)
                 : nextAligned(now, this.freq.ms);
 
+        // anti-spin. A backward clock can put the computed
+        // boundary in the past; poll gently instead of firing every 100 ms.
+        const delta = next - this._now();
+        const delay = delta < 0 ? TIMER_POLL_MS : Math.max(100, delta);
+
         this._timer = setTimeout(
             () => {
                 this._job(async () => {
                     const stamp = this._stampNow();
-                    const dueDaily = this.freq.type === "daily" && stamp !== this._curStamp;
-                    const dueInterval = this.freq.type !== "daily";
-                    if (dueDaily || dueInterval) {
+
+                    if (this.freq.type !== "daily") {
+                        /* interval rotation is schedule-based; runs regardless of
+                           stamp movement */
+                        if (this._hasContent()) await this._rotate("time");
+                    } else if (this._stampAdvanced(stamp)) {
+                        // guarded daily branch
                         if (this._hasContent()) {
                             await this._rotate("time");
-                        } else if (stamp !== this._curStamp) {
+                        } else {
+                            /* idle boundary slide — no file created for empty days */
                             this._curStamp = stamp;
                             this._index = this._recoverIndexFor(stamp);
                             if (this._auditEnabled) {
@@ -583,10 +658,12 @@ export class RotateFileStream extends Writable {
                             this.emit("period", stamp);
                         }
                     }
+                    /* stamp regressed or unchanged → keep current segment, re-arm */
+
                     this._armTimer();
                 }).catch(() => { });
             },
-            Math.max(100, next - this._now()),
+            delay,
         );
         if (this.unrefTimers) this._timer.unref();
     }
@@ -614,7 +691,8 @@ export class RotateFileStream extends Writable {
         this._armTimer();
 
         const stamp = this._stampNow();
-        if (stamp !== this._curStamp) {
+        // guarded crossing (virtual clock can't roll backward either)
+        if (this._stampAdvanced(stamp)) {
             if (this._hasContent()) {
                 await this._rotate("time");
             } else {
@@ -653,8 +731,16 @@ export class RotateFileStream extends Writable {
         try {
             parsed = JSON.parse(fs.readFileSync(this._auditPath, "utf8"));
         } catch {
-            return false; // missing/unreadable → fresh start
+            // unparseable manifest is quarantined too (was silently
+            // clobbered by the first save — caught by the quarantine test)
+            try {
+                fs.renameSync(this._auditPath, `${this._auditPath}.corrupt`);
+            } catch {
+                /* ignore */
+            }
+            return false;
         }
+
         const j = parsed as Partial<AuditDoc> | null;
 
         if (!j || j.version !== 1 || j.prefix !== this._tL || j.ext !== this._tExt) {
@@ -802,6 +888,61 @@ export class RotateFileStream extends Writable {
         }
     }
 
+    /**
+     * DISK-DRIVEN seal. Seal raw segments whose period has
+     * already passed (crash near midnight, virtual-clock leftovers,
+     * untracked/pruned files). Iterates the DIRECTORY, not the manifest:
+     * the filesystem is the source of truth; the manifest is an index.
+     */
+    private async _sealOrphanedPastStamps(): Promise<void> {
+        if (!this.zippedArchive) return;
+
+        const stampRx = new RegExp(
+            "^" + escRe(this._tL) + "(.+?)" + escRe(this._tMid) +
+            "(?:\\.\\d+)?" + escRe(this._tExt) + "(?:\\.gz)?$",
+        );
+
+        let names: string[] = [];
+        try {
+            names = fs.readdirSync(this.dir);
+        } catch {
+            return;
+        }
+
+        for (const name of names) {
+            if (name.endsWith(".gz")) continue;
+            if (name === (this._path && path.basename(this._path))) continue;
+
+            const stamp = stampRx.exec(name)?.[1];
+            // lexicographic compare is safe for zero-padded patterns (YYYY-MM-DD…);
+            // also guards the current stamp and anything future-dated
+            if (!stamp || stamp >= this._curStamp) continue;
+
+            const full = path.join(this.dir, name);
+            if (!existsSafe(full) || statSizeSafe(full) === 0) continue;
+
+            const ok = await gzipMove(full, `${full}.gz`, (e) => this.emit("warn", e));
+            if (!ok) continue;
+
+            if (this._auditEnabled && this._audit.files[name]) {
+                // tracked → re-key record name → name.gz (emits archive + journal)
+                this._finishArchivedRecord(name, true);
+            } else {
+                // untracked → record it fresh so future reconciles see truth
+                const gzName = `${name}.gz`;
+                if (this._auditEnabled) {
+                    this._audit.files[gzName] = {
+                        state: "archived",
+                        gzipPending: false,
+                        archivedAt: new Date().toISOString(),
+                    };
+                    this._aevent("seal-past", { file: gzName });
+                }
+                this.emit("archive", path.join(this.dir, gzName));
+            }
+        }
+    }
+
     private async _repairInterruptedGzips(): Promise<void> {
         for (const [name, rec] of Object.entries(this._audit.files)) {
             if (!rec.gzipPending) continue;
@@ -852,61 +993,6 @@ export class RotateFileStream extends Writable {
         this._audit.files[gzName] = rec;
         this.emit("archive", path.join(this.dir, gzName));
         this._aevent("archive", { file: gzName, ...(repaired && { repaired }) });
-    }
-
-    /**
- * Seal raw segments whose period has already passed (crash near midnight,
- * virtual-clock leftovers, untracked files). Disk is the source of truth —
- * manifest-tracked or not, a raw tail nothing will ever write to again
- * must still honour zippedArchive.
- */
-    private async _sealOrphanedPastStamps(): Promise<void> {
-        if (!this.zippedArchive) return;
-
-        const stampRx = new RegExp(
-            "^" + escRe(this._tL) + "(.+?)" + escRe(this._tMid) +
-            "(?:\\.\\d+)?" + escRe(this._tExt) + "(?:\\.gz)?$",
-        );
-
-        let names: string[] = [];
-        try {
-            names = fs.readdirSync(this.dir);
-        } catch {
-            return;
-        }
-
-        for (const name of names) {
-            if (name.endsWith(".gz")) continue;
-            if (name === (this._path && path.basename(this._path))) continue;
-
-            const stamp = stampRx.exec(name)?.[1];
-            // lexicographic compare is safe for zero-padded patterns (YYYY-MM-DD…);
-            // also guards the current stamp and anything future-dated
-            if (!stamp || stamp >= this._curStamp) continue;
-
-            const full = path.join(this.dir, name);
-            if (!existsSafe(full) || statSizeSafe(full) === 0) continue;
-
-            const ok = await gzipMove(full, `${full}.gz`, (e) => this.emit("warn", e));
-            if (!ok) continue;
-
-            if (this._auditEnabled && this._audit.files[name]) {
-                // tracked → re-key record name → name.gz (emits archive + journal)
-                this._finishArchivedRecord(name, true);
-            } else {
-                // untracked → record it fresh so future reconciles see a truthful state
-                const gzName = `${name}.gz`;
-                if (this._auditEnabled) {
-                    this._audit.files[gzName] = {
-                        state: "archived",
-                        gzipPending: false,
-                        archivedAt: new Date().toISOString(),
-                    };
-                    this._aevent("seal-past", { file: gzName });
-                }
-                this.emit("archive", path.join(this.dir, gzName));
-            }
-        }
     }
 
     /* ==================================================================

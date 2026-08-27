@@ -34,12 +34,36 @@ const pad2 = (n: string): string => n.padStart(2, "0");
 
 /** Escape a literal string for embedding inside a RegExp. */
 export function escRe(s: string): string {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return s.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 }
 
 /** Substitute YYYY|YY|MM|DD|HH|mm|ss tokens in `pattern`. */
-export function formatStamp(pattern: string, parts: Record<string, string>): string {
-    return pattern.replace(/YYYY|YY|MM|DD|HH|mm|ss/g, (t) => t === "YYYY" ? parts.year : t === "YY" ? parts.year.slice(-2) : t === "MM" ? pad2(parts.month) : t === "DD" ? pad2(parts.day) : t === "HH" ? pad2(parts.hour) : t === "mm" ? pad2(parts.minute) : t === "ss" ? pad2(parts.second) : t,
+export function formatStamp(
+    pattern: string,
+    parts: Record<string, string>,
+): string {
+    return pattern.replace(
+        /YYYY|YY|MM|DD|HH|mm|ss/g,
+        (token) => {
+            switch (token) {
+                case "YYYY":
+                    return parts.year;
+                case "YY":
+                    return parts.year.slice(-2);
+                case "MM":
+                    return pad2(parts.month);
+                case "DD":
+                    return pad2(parts.day);
+                case "HH":
+                    return pad2(parts.hour);
+                case "mm":
+                    return pad2(parts.minute);
+                case "ss":
+                    return pad2(parts.second);
+                default:
+                    return token;
+            }
+        },
     );
 }
 

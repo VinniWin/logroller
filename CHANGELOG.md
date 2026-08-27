@@ -5,7 +5,39 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.1] — 2026-09-0X
+## [2.0.2] — 2026-08-28
+
+### Fixed
+
+- **Corrupt audit manifest quarantine**: an unparseable `<stem>_audit.json`
+  (partial write, bad edit) is now renamed to `.corrupt` and preserved,
+  matching existing behaviour for version/family mismatches. Previously it
+  was silently overwritten by the first manifest save, destroying the
+  event journal.
+- **Backward-clock safety**: a clock moving backward (NTP correction,
+  manual change) no longer reopens a past log family or forks the segment
+  series. The stream keeps the current segment, warns once, and resumes
+  normal rotation when the clock catches up.
+- **Timer anti-spin**: with the rotation boundary in the past (backward
+  clock), the timer now polls at 1 s instead of firing every 100 ms,
+  which previously could keep processes from exiting cleanly.
+
+### Added
+
+- **Construction-time pattern warning**: warns when `frequency` is finer
+  than the `datePattern` tokens allow (`daily`→`DD`, sub-daily→`HH`,
+  sub-minute→`mm`), preventing silent filename collisions where many
+  rotations overwrite a single file.
+
+### Tests
+
+- Suite expanded to 23 tests: interrupted-gzip repair, manifest divergence
+  healing (`archive-regressed`, `vanished`), manifest quarantine,
+  concurrent-writer detection, IST-midnight boundary, idle `period` slide,
+  `rotateNow()`, over-max resume, backward-clock guard, and coarse-pattern
+  warning.
+
+## [2.0.1] — 2026-08-27
 
 ### Fixed
 
@@ -42,7 +74,7 @@ TypeScript consumers gain full type coverage.
 - Modular source layout (`src/types.ts`, `parsers.ts`, `time.ts`, `fsio.ts`,
   `rotate-file-stream.ts`) with `.js` extension imports so emitted
   declarations resolve under `nodenext` consumers.
-- Developer toolchain:  Prettier, `npm run verify` gate (typecheck + build + tests).
+- Developer toolchain: Prettier, `npm run verify` gate (typecheck + build + tests).
 - GitHub Actions: CI matrix on Node 18/20/22, release-triggered publish with
   npm provenance (`id-token: write`, `--provenance`).
 - Expanded README: comparison table, FAQ, restart-resume matrix, pino recipe.
