@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] — 2026-09-0X
+
+### Fixed
+
+- Reactivated segments no longer inherit stale lifecycle timestamps
+  (`abandonedAt` could predate `openedAt`).
+- Raw tails of already-passed periods are now gzipped at boot
+  (crash-near-midnight no longer leaves yesterday's file uncompressed).
+- Rotation adopts a `.gz` produced by a (warned-about) concurrent writer
+  instead of recording a false `drop-empty` that orphaned the archive.
+
 ## [2.0.0] — 2026-08-28
 
 Architecture release: the library moved from a single-file JavaScript SDK to a
@@ -17,6 +28,7 @@ TypeScript consumers gain full type coverage.
 > upgrading — mostly due to the deterministic boot-order fix below.
 
 ### Added
+
 - **Full TypeScript source with shipped declarations** (`dist/index.d.ts`);
   strict-mode compile (`noImplicitOverride`, `noUnusedLocals`,
   `verbatimModuleSyntax`, …).
@@ -30,13 +42,13 @@ TypeScript consumers gain full type coverage.
 - Modular source layout (`src/types.ts`, `parsers.ts`, `time.ts`, `fsio.ts`,
   `rotate-file-stream.ts`) with `.js` extension imports so emitted
   declarations resolve under `nodenext` consumers.
-- Developer toolchain: ESLint 9 flat config + typescript-eslint, Prettier,
-  EditorConfig, `npm run verify` gate (lint + typecheck + build + tests).
+- Developer toolchain:  Prettier, `npm run verify` gate (typecheck + build + tests).
 - GitHub Actions: CI matrix on Node 18/20/22, release-triggered publish with
   npm provenance (`id-token: write`, `--provenance`).
 - Expanded README: comparison table, FAQ, restart-resume matrix, pino recipe.
 
 ### Fixed
+
 - **Deterministic boot sequencing**: housekeeping (zombie demotion, disk
   reconciliation, interrupted-gzip repair) is chained as job #1 of the
   serial operation queue in the constructor instead of `process.nextTick`,
@@ -45,6 +57,7 @@ TypeScript consumers gain full type coverage.
 - Retention sweep skips `<audit>.corrupt` artifacts alongside `.tmp`.
 
 ### Changed
+
 - Internals restructured behind the same public exports; barrels re-export
   types explicitly (`import type { RotatedInfo } from "logroller"`).
 - Stricter package hygiene metadata: `sideEffects: false`, explicit
@@ -54,7 +67,7 @@ TypeScript consumers gain full type coverage.
   manifest creation, size rotation/gzip/indexing, restart resume,
   `addHours` naming, virtual midnight crossing, count-retention ordering
   (mtime-deterministic), zombie-record lifecycle (`abandon → active →
-  closed`), and CJS loadability through the exports map.
+closed`), and CJS loadability through the exports map.
 
 ## [1.0.0] — 2026-08-26
 
@@ -63,6 +76,7 @@ Initial release. Single-file zero-dependency JavaScript SDK
 rotation.
 
 ### Added
+
 - Time-based rotation: `frequency: "daily"` (local midnight in any IANA
   timezone via `Intl`) or epoch-aligned intervals (`"30s"`, `"5m"`, `"2h"`).
 - Size-based rotation: `maxSize` (`"20m"` / `"512k"` / raw bytes) producing

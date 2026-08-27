@@ -227,6 +227,7 @@ export class RotateFileStream extends Writable {
             if (this._auditEnabled) {
                 this._demoteZombieActives();
                 this._reconcileWithDisk();
+                await this._sealOrphanedPastStamps();   
                 await this._repairInterruptedGzips();
                 this._aevent("boot", { stamp: this._curStamp, index: this._index });
                 this._saveAudit();
@@ -448,9 +449,7 @@ export class RotateFileStream extends Writable {
 
         if (this._auditEnabled) {
             const base = path.basename(p);
-            const prev = this._audit.files[base];
             this._audit.files[base] = {
-                ...(prev && prev.state === "archived" ? {} : prev),
                 index: this._index,
                 state: "active",
                 gzipPending: false,
@@ -502,49 +501,49 @@ export class RotateFileStream extends Writable {
                     archive = null;
                 }
             } else if (realBytes === 0) {
-                try {
-                    fs.unlinkSync(oldPath);
-                } catch {
-                    /* already gone */
+                const adoptedGz = `${oldPath}.gz`;
+                if (existsSafe(adoptedGz)) {
+                    // A concurrent writer archived this segment between our last stat
+                    // and now — adopt its artifact instead of dropping the record.
+                    this._finishArchivedRecord(oldBase);
+                    archive = adoptedGz;
+                } else {
+                    try { fs.unlinkSync(oldPath); } catch { /* already gone */ }
+                    if (rec) delete this._audit.files[oldBase];
+                    this._aevent("drop-empty", { file: oldBase });
                 }
-                if (rec) delete this._audit.files[oldBase];
-                this._aevent("drop-empty", { file: oldBase });
-            } else if (rec) {
-                rec.state = "sealed";
-                rec.bytes = realBytes;
             }
+
+            const stamp = this._stampNow();
+            const newPeriod = stamp !== this._curStamp;
+            this._curStamp = stamp;
+            /* Never blind-reset to 0 — recover what THIS stamp already owns. */
+            this._index =
+                newPeriod || kind === "time"
+                    ? this._recoverIndexFor(stamp)
+                    : this._index + 1;
+            this._bytes = 0;
+
+            if (this._auditEnabled) {
+                this._setActivePointer(this._index);
+                this._aevent("rotate", { reason: kind, nextIndex: this._index, stamp });
+                this._saveAudit();
+            }
+
+            if (kind === "time" || kind === "manual") this._armTimer();
+
+            if (oldPath) {
+                this.emit("rotated", {
+                    reason: kind,
+                    oldFile: oldPath,
+                    archive,
+                    newFile: this._resolveName(stamp, this._index),
+                });
+            }
+
+            this._retire();
         }
-
-        const stamp = this._stampNow();
-        const newPeriod = stamp !== this._curStamp;
-        this._curStamp = stamp;
-        /* Never blind-reset to 0 — recover what THIS stamp already owns. */
-        this._index =
-            newPeriod || kind === "time"
-                ? this._recoverIndexFor(stamp)
-                : this._index + 1;
-        this._bytes = 0;
-
-        if (this._auditEnabled) {
-            this._setActivePointer(this._index);
-            this._aevent("rotate", { reason: kind, nextIndex: this._index, stamp });
-            this._saveAudit();
-        }
-
-        if (kind === "time" || kind === "manual") this._armTimer();
-
-        if (oldPath) {
-            this.emit("rotated", {
-                reason: kind,
-                oldFile: oldPath,
-                archive,
-                newFile: this._resolveName(stamp, this._index),
-            });
-        }
-
-        this._retire();
     }
-
     /* ==================================================================
      * Timers
      * ================================================================ */
@@ -853,6 +852,61 @@ export class RotateFileStream extends Writable {
         this._audit.files[gzName] = rec;
         this.emit("archive", path.join(this.dir, gzName));
         this._aevent("archive", { file: gzName, ...(repaired && { repaired }) });
+    }
+
+    /**
+ * Seal raw segments whose period has already passed (crash near midnight,
+ * virtual-clock leftovers, untracked files). Disk is the source of truth —
+ * manifest-tracked or not, a raw tail nothing will ever write to again
+ * must still honour zippedArchive.
+ */
+    private async _sealOrphanedPastStamps(): Promise<void> {
+        if (!this.zippedArchive) return;
+
+        const stampRx = new RegExp(
+            "^" + escRe(this._tL) + "(.+?)" + escRe(this._tMid) +
+            "(?:\\.\\d+)?" + escRe(this._tExt) + "(?:\\.gz)?$",
+        );
+
+        let names: string[] = [];
+        try {
+            names = fs.readdirSync(this.dir);
+        } catch {
+            return;
+        }
+
+        for (const name of names) {
+            if (name.endsWith(".gz")) continue;
+            if (name === (this._path && path.basename(this._path))) continue;
+
+            const stamp = stampRx.exec(name)?.[1];
+            // lexicographic compare is safe for zero-padded patterns (YYYY-MM-DD…);
+            // also guards the current stamp and anything future-dated
+            if (!stamp || stamp >= this._curStamp) continue;
+
+            const full = path.join(this.dir, name);
+            if (!existsSafe(full) || statSizeSafe(full) === 0) continue;
+
+            const ok = await gzipMove(full, `${full}.gz`, (e) => this.emit("warn", e));
+            if (!ok) continue;
+
+            if (this._auditEnabled && this._audit.files[name]) {
+                // tracked → re-key record name → name.gz (emits archive + journal)
+                this._finishArchivedRecord(name, true);
+            } else {
+                // untracked → record it fresh so future reconciles see a truthful state
+                const gzName = `${name}.gz`;
+                if (this._auditEnabled) {
+                    this._audit.files[gzName] = {
+                        state: "archived",
+                        gzipPending: false,
+                        archivedAt: new Date().toISOString(),
+                    };
+                    this._aevent("seal-past", { file: gzName });
+                }
+                this.emit("archive", path.join(this.dir, gzName));
+            }
+        }
     }
 
     /* ==================================================================

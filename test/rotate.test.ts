@@ -261,3 +261,34 @@ test("cjs bundle loads", () => {
   assert.equal(typeof cjs.createStream, "function");
   assert.equal(typeof cjs.RotateFileStream, "function");
 });
+
+test("raw tail of a past stamp is sealed at boot", async () => {
+  const dir = tmp();
+  const yesterday = stampOf(-1);
+  fs.writeFileSync(path.join(dir, `app-${yesterday}.log`), "crash tail\n");
+
+  const s = createStream({
+    filename: `${dir}/app-%DATE%.log`,
+    zippedArchive: true, tz: "UTC",
+  });
+  await settle(300);
+  await end(s);
+
+  assert.ok(fs.existsSync(path.join(dir, `app-${yesterday}.log.gz`)));
+  assert.ok(!fs.existsSync(path.join(dir, `app-${yesterday}.log`)));
+});
+
+test("orphan raw+gz pair is recompressed and raw removed", async () => {
+  const dir = tmp();
+  const yday = stampOf(-1);
+  fs.writeFileSync(path.join(dir, `app-${yday}.log`), "tail\n");
+  fs.writeFileSync(path.join(dir, `app-${yday}.log.gz`), "stale-archive");
+
+  const s = createStream({ filename: `${dir}/app-%DATE%.log`, zippedArchive: true, tz: "UTC" });
+  await settle(300);
+  await end(s);
+
+  const text = zlib.gunzipSync(fs.readFileSync(path.join(dir, `app-${yday}.log.gz`))).toString();
+  assert.match(text, /tail/);                       // .gz was refreshed, not stale
+  assert.ok(!fs.existsSync(path.join(dir, `app-${yday}.log`)));
+});

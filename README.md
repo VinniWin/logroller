@@ -1,4 +1,3 @@
-
 ## README.md
 
 <p align="center"><strong>logroller</strong></p>
@@ -72,11 +71,14 @@ const { createStream } = require("logroller");
 ### pino destination
 
 ```js
-const logger = pino(pino.multistream([
-  { level: "info", stream: createStream({ filename: "logs/general-%DATE%.log" }) },
-  { level: "error", stream: createStream({ filename: "logs/error-%DATE%.log" }) },
-]));
+const logger = pino(
+  pino.multistream([
+    { level: "info", stream: createStream({ filename: "logs/general-%DATE%.log" }) },
+    { level: "error", stream: createStream({ filename: "logs/error-%DATE%.log" }) },
+  ]),
+);
 ```
+
 ## What lands on disk
 
 ```
@@ -90,12 +92,12 @@ app_audit.json              ← library-owned manifest
 
 A killed process resumes without gaps or duplicates:
 
-| Disk at crash | Restart continues into |
-|---|---|
-| `app-D.log` | `app-D.log` (append) |
-| `app-D.log.gz` + `app-D.1.log` | `app-D.1.log` |
-| `app-D.1.log.gz` (chain sealed) | `app-D.2.log` |
-| died during a gzip | boot finishes the gzip, then proceeds |
+| Disk at crash                   | Restart continues into                |
+| ------------------------------- | ------------------------------------- |
+| `app-D.log`                     | `app-D.log` (append)                  |
+| `app-D.log.gz` + `app-D.1.log`  | `app-D.1.log`                         |
+| `app-D.1.log.gz` (chain sealed) | `app-D.2.log`                         |
+| died during a gzip              | boot finishes the gzip, then proceeds |
 
 ## API
 
@@ -103,41 +105,41 @@ A killed process resumes without gaps or duplicates:
 
 ### Options
 
-| Option | Values | Default |
-|---|---|---|
-| `filename` | **required**, must contain `%DATE%` | — |
-| `datePattern` | `YYYY YY MM DD HH mm ss` | `YYYY-MM-DD` |
-| `zippedArchive` | boolean | `false` |
-| `maxSize` | `20m`, `512k`, `2g`, bytes, `0`=off | off |
-| `maxFiles` | `"90d"` age, `500` count, unset=never | — |
-| `frequency` | `daily`, `30s`, `5m`, `2h`, ms | `daily` |
-| `tz` | any IANA zone | `UTC` |
-| `audit` / `auditFile` | manifest control | `true` / auto-name |
-| `unrefTimers` | detach from event loop | `false` |
-| `addHours` | ⚠️ static clock shift, test only | off |
-| `addHoursEveryMin` | ⚠️ virtual time per tick, test only | off |
-| `clockStepIntervalMs` | tick interval | `60000` |
+| Option                | Values                                | Default            |
+| --------------------- | ------------------------------------- | ------------------ |
+| `filename`            | **required**, must contain `%DATE%`   | —                  |
+| `datePattern`         | `YYYY YY MM DD HH mm ss`              | `YYYY-MM-DD`       |
+| `zippedArchive`       | boolean                               | `false`            |
+| `maxSize`             | `20m`, `512k`, `2g`, bytes, `0`=off   | off                |
+| `maxFiles`            | `"90d"` age, `500` count, unset=never | —                  |
+| `frequency`           | `daily`, `30s`, `5m`, `2h`, ms        | `daily`            |
+| `tz`                  | any IANA zone                         | `UTC`              |
+| `audit` / `auditFile` | manifest control                      | `true` / auto-name |
+| `unrefTimers`         | detach from event loop                | `false`            |
+| `addHours`            | ⚠️ static clock shift, test only      | off                |
+| `addHoursEveryMin`    | ⚠️ virtual time per tick, test only   | off                |
+| `clockStepIntervalMs` | tick interval                         | `60000`            |
 
 ### Methods
 
-| Method | Returns | Purpose |
-|---|---|---|
-| `write / end / destroy` | stream semantics | normal `Writable` |
-| `rotateNow()` | `Promise<void>` | force a rotation |
-| `advanceClock()` | `Promise<void>` | apply one virtual tick now |
+| Method                  | Returns          | Purpose                    |
+| ----------------------- | ---------------- | -------------------------- |
+| `write / end / destroy` | stream semantics | normal `Writable`          |
+| `rotateNow()`           | `Promise<void>`  | force a rotation           |
+| `advanceClock()`        | `Promise<void>`  | apply one virtual tick now |
 
 ### Events (typed)
 
-| Event | Payload | Meaning |
-|---|---|---|
-| `open` | `file` | segment opened for appending |
-| `rotated` | `{reason, oldFile, archive, newFile}` | segment closed |
-| `archive` | `gzFile` | gzip finished |
-| `deleted` | `file` | retention removed it |
-| `period` | `stamp` | boundary crossed while idle |
-| `clock` | `{offsetMs, …}` | virtual clock engaged |
-| `warn` | `Error` | non-fatal problems |
-| `error` | `Error` | fatal write problems |
+| Event     | Payload                               | Meaning                      |
+| --------- | ------------------------------------- | ---------------------------- |
+| `open`    | `file`                                | segment opened for appending |
+| `rotated` | `{reason, oldFile, archive, newFile}` | segment closed               |
+| `archive` | `gzFile`                              | gzip finished                |
+| `deleted` | `file`                                | retention removed it         |
+| `period`  | `stamp`                               | boundary crossed while idle  |
+| `clock`   | `{offsetMs, …}`                       | virtual clock engaged        |
+| `warn`    | `Error`                               | non-fatal problems           |
+| `error`   | `Error`                               | fatal write problems         |
 
 Errors must be handled — attach a listener on every instance.
 
@@ -147,21 +149,21 @@ Errors must be handled — attach a listener on every instance.
 const s = createStream({
   filename: "logs/demo-%DATE%.log",
   zippedArchive: true,
-  addHoursEveryMin: "24h",     // one day per real minute
-  clockStepIntervalMs: 1000,   // or faster
+  addHoursEveryMin: "24h", // one day per real minute
+  clockStepIntervalMs: 1000, // or faster
 });
-await s.advanceClock();         // jump instantly when useful
+await s.advanceClock(); // jump instantly when useful
 ```
 
 ## FAQ
 
 **Why is `%DATE%` mandatory?**
-It is the anchor that decouples *rotation scheduling* from *filenames*.
+It is the anchor that decouples _rotation scheduling_ from _filenames_.
 Coarser patterns than your frequency collapse distinct segments onto one
 name — match tokens to cadence (`HH` for hourly, etc.).
 
 **Can two processes share one directory?**
-Different prefixes/families: yes. The *same* family: no — the audit
+Different prefixes/families: yes. The _same_ family: no — the audit
 manifest detects a live second writer (`writer.heartbeat`) and warns loudly.
 
 **Is the audit JSON required?**
@@ -174,19 +176,19 @@ Pure Node APIs; path handling via `node:path`. All three supported
 
 ## Compare
 
-| | logroller | file-stream-rotator | rotating-file-stream | winston-daily-rotate-file |
-|---|---|---|---|---|
-| Dependencies | **0** | 4+ | 2+ | winston-bound |
-| Crash-safe resume | ✅ audit-assisted | partial | partial | ✖ |
-| Interrupted-gzip repair | ✅ | ✖ | ✖ | ✖ |
-| Event journal | ✅ | ✖ | ✖ | ✖ |
-| TZ-correct daily rollover | ✅ | partial | ✅ | ✅ |
-| Virtual test clock | ✅ | ✖ | ✖ | ✖ |
-| Winston required | no | no | no | yes |
+|                           | logroller         | file-stream-rotator | rotating-file-stream | winston-daily-rotate-file |
+| ------------------------- | ----------------- | ------------------- | -------------------- | ------------------------- |
+| Dependencies              | **0**             | 4+                  | 2+                   | winston-bound             |
+| Crash-safe resume         | ✅ audit-assisted | partial             | partial              | ✖                         |
+| Interrupted-gzip repair   | ✅                | ✖                   | ✖                    | ✖                         |
+| Event journal             | ✅                | ✖                   | ✖                    | ✖                         |
+| TZ-correct daily rollover | ✅                | partial             | ✅                   | ✅                        |
+| Virtual test clock        | ✅                | ✖                   | ✖                    | ✖                         |
+| Winston required          | no                | no                  | no                   | yes                       |
 
 ## Contributing
 
-PRs welcome. `npm run verify` gates every change (lint + typecheck + tests).
+PRs welcome. `npm run verify` gates every change (typecheck + tests).
 Please file issues before large refactors.
 
 ## License
