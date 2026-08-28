@@ -20,15 +20,20 @@ export const existsSafe = (p: string): boolean => {
 };
 
 /**
- * Compress `src` → `dst`, deleting `src` ONLY on verified success.
- * On failure removes the partial `dst` and reports via callback —
+ * Compress `src` → `dst` at gzip `level`, deleting `src` ONLY on verified
+ * success. On failure removes the partial `dst` and reports via callback —
  * logs degrade to uncompressed rather than losing data.
  */
-export async function gzipMove(src: string, dst: string, onWarn?: (err: Error) => void,): Promise<boolean> {
+export async function gzipMove(
+    src: string,
+    dst: string,
+    onWarn?: (err: Error) => void,
+    level = 6,
+): Promise<boolean> {
     try {
         await pipeline(
             fs.createReadStream(src),
-            zlib.createGzip({ level: 6 }),
+            zlib.createGzip({ level }),
             fs.createWriteStream(dst),
         );
         await fs.promises.unlink(src);

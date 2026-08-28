@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-08-28
+
+### Added
+
+- `symlink: true | string` — stable "current" pointer (e.g. `app-current.log`)
+  for `tail -f`/Filebeat/promtail; atomically flipped on every segment open;
+  degrades gracefully on symlink-denying filesystems; excluded from retention.
+- `maxTotalSize: "5g"` — byte-budget retention: deletes OLDEST archives until
+  under budget; composes with `maxFiles`.
+- `onSeal` hook (+ `sealHookTimeoutMs`) — awaited after a segment is archived
+  and BEFORE retention can delete it: the S3/GCS upload extension point.
+  Errors/timeouts degrade to `warn`; rotation never stalls.
+- `installShutdown(streams)` / `flushAll()` — graceful SIGINT/SIGTERM
+  handling that flushes buffered writes before exit (fixes the classic
+  "last log lines missing" support case).
+- `stats()` and `listSegments()` — health snapshot and per-file listing.
+- `compressionLevel` (0–9, default 6) — passes through to gzip.
+
 ## [2.0.2] — 2026-08-28
 
 ### Fixed

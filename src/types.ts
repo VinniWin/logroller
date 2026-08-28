@@ -10,138 +10,176 @@ export type RotationReason = "time" | "size" | "manual";
 export interface RotateFileStreamOptions {
     /**
      * Destination filename pattern. REQUIRED and must contain the `%DATE%`
-     * token, which is replaced by the formatted current date/time.
-     *
+     * token.
      * @example "logs/app-%DATE%.log"
      */
     filename: string;
 
-    /**
-     * Date token pattern substituted for `%DATE%`.
-     *
-     * Supported tokens: `YYYY YY MM DD HH mm ss`.
-     * Use tokens coarser-or-equal to your rotation frequency — hourly
-     * rotation with a day-only pattern collapses multiple files onto one name.
-     *
-     * @default "YYYY-MM-DD"
-     */
+    /** Tokens: `YYYY YY MM DD HH mm ss`. Must be coarse-or-equal to your
+     *  rotation frequency, or segments collapse onto one name.
+     * @default "YYYY-MM-DD" */
     datePattern?: string;
 
-    /** Gzip closed segments (`name.log` → `name.log.gz`). */
-    /** @default false */
+    /** Gzip closed segments (`name.log` → `name.log.gz`).
+     * @default false */
     zippedArchive?: boolean;
 
     /**
-     * Maximum bytes per segment before rolling. Accepts raw numbers (bytes)
-     * or human strings: `"20m"`, `"512k"`, `"2g"`, `"100b"`.
-     * `0` disables size-based rotation.
+     * gzip level 0–9. 0 = stored (fastest, no ratio), 9 = best ratio,
+     * 6 = default library default. Ignored when `zippedArchive` is false.
+     * @default 6
+     */
+    compressionLevel?: number;
+
+    /**
+     * Roll when the next write would exceed this size per segment.
+     * `"20m"`, `"512k"`, `"2g"`, or raw bytes. `0` disables.
      * @default 0 (unlimited)
      */
     maxSize?: number | string;
 
     /**
-     * Retention policy for this stream family.
-     * - `"90d"` — delete archived files older than 90 days (by mtime)
+     * Retention by age or count:
+     * - `"90d"` — delete archived files older than 90 days (mtime)
      * - `500`   — keep at most the newest 500 archived files
-     * Unset means **never** auto-delete.
+     * Unset means never auto-delete.
      */
     maxFiles?: number | string;
 
     /**
-     * IANA timezone used for date stamps and the daily boundary.
-     * Resolved via `Intl.DateTimeFormat`; throws early if invalid.
-     * @default "UTC"
+     * Retention by total byte budget across archived files (the active
+     * segment is never counted). When archives exceed the budget, the
+     * OLDEST are deleted until under budget. Composes with `maxFiles`
+     * (either policy may delete). `"5g"`, `"500m"`, or raw bytes.
+     * Unset/0 = no byte budget.
      */
+    maxTotalSize?: number | string;
+
+    /** IANA timezone for stamps and the daily boundary.
+     * @default "UTC" */
     tz?: string;
 
-    /**
-     * Rotation cadence: `"daily"` (local midnight in `tz`) or an interval
-     * like `"30s"`, `"5m"`, `"2h"`, or a millisecond number.
-     * Interval boundaries align to epoch multiples (hh:00:00 for `"1h"`).
-     * @default "daily"
-     */
+    /** `"daily"` (local midnight in `tz`) or interval `"30s"`/`"5m"`/`"2h"`
+     *  /ms. Interval boundaries align to epoch multiples.
+     * @default "daily" */
     frequency?: number | string;
 
     /**
-     * TEST ONLY. Static shift of the internal clock, in hours.
-     * `"-6h"`, `"24h"`, or a plain number (fractional allowed).
-     * Affects naming, timers, and retention cutoffs — never production data.
+     * TEST ONLY. Static shift of the internal clock. `"-6h"`, `"24h"`,
+     * plain/fractional number, or `"30m"`/`"90s"`.
      */
     addHours?: number | string;
 
     /**
-     *  TEST ONLY. Amount of virtual time added to the internal clock at
-     * every tick ({@linkcode RotateFileStreamOptions.clockStepIntervalMs}),
-     * simulating passing days: crossing into a new period archives the old
-     * segment exactly like a real midnight roll.
+     * TEST ONLY. Virtual time added per tick (see `clockStepIntervalMs`).
+     * Negative values exercise the backward-clock guard (no rotations).
      */
     addHoursEveryMin?: number | string;
 
-    /**
-     * Real interval between virtual-clock ticks (see `addHoursEveryMin`).
-     * Lower it to fast-forward faster in integration tests.
-     * @default 60_000
-     */
+    /** Real interval between virtual-clock ticks.
+     * @default 60_000 */
     clockStepIntervalMs?: number;
 
-    /** Detach rotation timers from the event loop (`timer.unref()`). */
-    /** @default false */
-    unrefTimers?: boolean;
+    /**
+     * Maintain a stable "current" pointer for log collectors
+     * (`tail -f`, Filebeat, promtail). `true` derives the name from the
+     * prefix (`"app-"` → `app-current.log`); a string names it exactly.
+     * The link is updated atomically each time a segment opens. Best-effort:
+     * on filesystems denying symlinks (Windows without Developer Mode) it
+     * warns once and disables itself.
+     * @default false */
+    symlink?: boolean | string;
 
     /**
-     * Maintain `<stem>_audit.json` beside the logs: lifecycle manifest,
-     * uuid-tagged journal, restart recovery, interrupted-gzip repair,
-     * zombie-process detection. Library-owned; treat as read-only.
-     * @default true
-     */
+     * Awaited after a segment is sealed/archived and BEFORE retention can
+     * delete it — the extension point for uploading to S3/GCS. Errors and
+     * timeouts degrade to a `warn`; they never break rotation.
+     * @default undefined */
+    onSeal?: (info: SealInfo) => Promise<void> | void;
+
+    /** Hard deadline for one `onSeal` invocation.
+     * @default 30_000 */
+    sealHookTimeoutMs?: number;
+
+    /** Detach rotation timers from the event loop.
+     * @default false */
+    unrefTimers?: boolean;
+
+    /** Maintain `<stem>_audit.json` (library-owned; treat as read-only).
+     * @default true */
     audit?: boolean;
 
-    /** Override the audit manifest filename. Default derives from the prefix. */
+    /** Override the audit manifest filename. */
     auditFile?: string;
 
     /** Passed through to the underlying `Writable`. */
     highWaterMark?: number;
 }
 
+/** Payload delivered to `onSeal` when a segment completes its lifecycle. */
+export interface SealInfo {
+    /** Closed segment path. May already be unlinked when `gz` exists. */
+    raw: string;
+    /** Compressed artifact; `null` when compression is off or failed. */
+    gz: string | null;
+}
+
+/** One file of the stream family, as reported by `listSegments()`. */
+export interface SegmentInfo {
+    file: string;
+    /** Date stamp embedded in the filename. */
+    stamp: string;
+    /** Segment index within the stamp (0 = base file). */
+    index: number;
+    gzipped: boolean;
+    bytes: number;
+    /** Audit state, or `"untracked"` for files unknown to the manifest. */
+    state: string;
+    openedAt?: string;
+    archivedAt?: string;
+}
+
+/** Snapshot for dashboards/health checks — see `stats()`. */
+export interface StreamStats {
+    dir: string;
+    currentStamp: string;
+    activeFile: string | null;
+    activeIndex: number;
+    /** All family files on disk (active included). */
+    segments: number;
+    /** Of those, how many are compressed archives. */
+    archived: number;
+    totalBytes: number;
+    /** Active virtual-clock shift (non-zero only under test knobs). */
+    clockOffsetMs: number;
+    /** Active symlink path, or `null`. */
+    symlink: string | null;
+}
+
 /** Payload for the `rotated` event. */
 export interface RotatedInfo {
     reason: RotationReason;
-    /** Segment that was closed; `null` when nothing was open. */
     oldFile: string | null;
-    /** Gzip artifact created for it; `null` when unzipped, empty, or failed. */
     archive: string | null;
-    /** Segment subsequent writes go to (opened lazily). */
     newFile: string;
 }
 
-/** Payload for the `clock` event (emitted when a virtual clock is active). */
+/** Payload for the `clock` event. */
 export interface ClockInfo {
     addHours?: number | string;
     addHoursEveryMin?: number | string;
     offsetMs: number;
 }
 
-/**
- * Tuple-style event map used to type `on` / `once` / `emit`.
- * Keys mirror Node core lifecycle events where relevant.
- */
+/** Tuple-style event map typing `on` / `once` / `emit`. */
 export interface RotateFileStreamEventMap {
-    /** A segment file was opened for appending. */
     open: [file: string];
-    /** A segment completed its lifecycle; see {@linkcode RotatedInfo}. */
     rotated: [info: RotatedInfo];
-    /** A gzip archive finished successfully. */
     archive: [gzFile: string];
-    /** Retention removed a file. */
     deleted: [file: string];
-    /** Period changed with nothing to archive (idle boundary slide). */
     period: [stamp: string];
-    /** Virtual clock engaged (test knobs). */
     clock: [info: ClockInfo];
-    /** Non-fatal problem: gzip failure, divergent state, stray writer… */
     warn: [err: Error];
-    /** Fatal problem mid-write; mirrors `Writable#close` semantics. */
     error: [err: Error];
-    /** Stream fully closed. */
     close: [];
 }

@@ -49,7 +49,7 @@ const settle = (ms = 150): Promise<void> =>
 
 test("writes to base file and creates audit manifest", async () => {
   const dir = tmp();
-  const s = createStream({ filename: `${dir}/app-%DATE%.log`, tz: "UTC" });
+  const s = createStream({ filename: `${dir}/app-%DATE%.log`, tz: "UTC", });
   s.write("hello\n");
   s.write("world\n");
   await end(s);
@@ -690,4 +690,23 @@ test("coarse datePattern with fine frequency warns at construction", () => {
       resolve();
     }, 50);
   });
+});
+
+test("parser edge cases: hours spelling, negative maxFiles, NaN-proof units", () => {
+  const dir = tmp();
+
+  // "-12hours" must parse (not NaN → later RangeError)
+  const s1 = createStream({ filename: `${dir}/a-%DATE%.log`, addHours: "-12hours" });
+  s1.destroy();
+
+  // bad value → clean validation error, never a downstream Invalid-time-value
+  assert.throws(
+    () => createStream({ filename: `${dir}/b-%DATE%.log`, addHours: "abc" }),
+    /Invalid addHours "abc"/,
+  );
+  // negative maxFiles → rejected up front
+  assert.throws(
+    () => createStream({ filename: `${dir}/c-%DATE%.log`, maxFiles: -1 }),
+    /Invalid maxFiles "-1"/,
+  );
 });

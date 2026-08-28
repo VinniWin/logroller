@@ -59,7 +59,7 @@
     "build": "tsc -p tsconfig.json && rollup -c",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.js\"",
-    "test": "node --test --experimental-strip-types test/rotate.test.ts",
+    "test": "npm run build && node --test --experimental-strip-types test/rotate.test.ts test/features.test.ts",
     "verify": "npm run typecheck && npm test",
     "prepublishOnly": "npm run verify",
     "release": "npm run verify && npm pack --dry-run"

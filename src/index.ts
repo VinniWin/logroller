@@ -3,11 +3,13 @@
  *
  * @packageDocumentation
  */
-export { RotateFileStream, createStream } from "./rotate-file-stream.js";
+export { createStream, RotateFileStream } from "./rotate-file-stream.js";
+export { flushAll, installShutdown } from "./shutdown.js";
+export type { ShutdownOptions } from "./shutdown.js";
 export type {
-  RotateFileStreamOptions,
-  RotateFileStreamEventMap,
-  RotatedInfo,
-  ClockInfo,
-  RotationReason,
+  ClockInfo, RotatedInfo, RotateFileStreamEventMap, RotateFileStreamOptions, RotationReason,
+  SealInfo,
+  SegmentInfo,
+  StreamStats
 } from "./types.js";
+

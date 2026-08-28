@@ -24,7 +24,9 @@ import {
 import type {
     RotateFileStreamEventMap,
     RotateFileStreamOptions,
-    RotationReason
+    RotationReason,
+    SegmentInfo,
+    StreamStats,
 } from "./types.js";
 
 const BUMP_DEFAULT_MS = 60_000;
@@ -97,17 +99,22 @@ const emptyAudit = (
 
 /**
  * A `Writable` that appends to dated log files, rolling segments on time
- * and/or size, optionally gzipping sealed segments, enforcing retention,
- * and resuming an unbroken series across restarts via disk scan + audit
- * manifest.
+ * and/or size, optionally gzipping sealed segments, enforcing retention
+ * (count, age, and total-byte budget), maintaining a stable "current"
+ * symlink for log collectors, running an awaited seal hook (upload
+ * pipeline), and resuming an unbroken series across restarts via disk
+ * scan + audit manifest.
  *
  * @example
  * ```ts
  * const log = createStream({
  *   filename: "logs/app-%DATE%.log",
  *   maxSize: "20m",
+ *   maxTotalSize: "5g",
  *   maxFiles: "90d",
  *   zippedArchive: true,
+ *   symlink: true,
+ *   onSeal: async ({ gz }) => uploadToS3(gz),
  * });
  * log.write("hello\n");          // or: readable.pipe(log)
  * ```
@@ -122,6 +129,7 @@ export class RotateFileStream extends Writable {
     readonly maxFiles: Readonly<ParsedMaxFiles> | null;
     readonly freq: ParsedFrequency;
     readonly unrefTimers: boolean;
+    readonly maxTotalSize: number;
 
     /* ---- filename-template pieces ---- */
     private readonly _tL: string;
@@ -134,6 +142,13 @@ export class RotateFileStream extends Writable {
     private readonly _auditEnabled: boolean;
     private readonly _auditPath: string;
     private readonly _bootId = randomUUID();
+
+    private readonly _onSeal?: NonNullable<
+        RotateFileStreamOptions["onSeal"]
+    >;
+    private readonly _sealHookTimeoutMs: number;
+    private readonly _compressionLevel: number;
+    private _symlinkPath: string | null = null;
 
     /* ---- virtual test clock ---- */
     private _offsetMs: number;
@@ -172,11 +187,17 @@ export class RotateFileStream extends Writable {
         this.zippedArchive = !!opts.zippedArchive;
         this.maxSize = parseSize(opts.maxSize ?? 0);
         this.maxFiles = parseMaxFiles(opts.maxFiles);
+        this.maxTotalSize = parseSize(opts.maxTotalSize ?? 0);
         this.freq = parseFrequency(opts.frequency);
         this.unrefTimers = !!opts.unrefTimers;
         this._offsetMs = parseClockOffset(opts.addHours);
         this._stepMs = parseClockStep(opts.addHoursEveryMin);
         this._bumpEvery = Math.max(50, opts.clockStepIntervalMs ?? BUMP_DEFAULT_MS);
+
+        // compression + seal hook
+        this._compressionLevel = Math.min(9, Math.max(0, opts.compressionLevel ?? 6));
+        this._onSeal = opts.onSeal;
+        this._sealHookTimeoutMs = Math.max(0, opts.sealHookTimeoutMs ?? 30_000);
 
         /* Split "prefix-%DATE%mid.ext" → pieces so indices land BETWEEN the
            stamp and the extension: prefix-STAMP.N.ext                       */
@@ -200,6 +221,16 @@ export class RotateFileStream extends Writable {
             .replace(/^[-.]+|[-.]+$/g, "");
         this._auditPath = path.join(this.dir, opts.auditFile || `${stem}_audit.json`);
 
+        // stable "current" pointer target
+        this._symlinkPath = opts.symlink
+            ? path.join(
+                this.dir,
+                typeof opts.symlink === "string"
+                    ? opts.symlink
+                    : `${stem}-current.log`,
+            )
+            : null;
+
         fs.mkdirSync(this.dir, { recursive: true });
 
         this._curStamp = this._stampNow();
@@ -222,7 +253,7 @@ export class RotateFileStream extends Writable {
             );
         }
 
-
+        // warn when frequency is finer than the datePattern tokens
         process.nextTick(() => {
             const warn = (m: string) => this.emit("warn", new Error(m));
             if (this.freq.type === "interval") {
@@ -244,6 +275,7 @@ export class RotateFileStream extends Writable {
            constructor so it deterministically precedes any write job: zombie
            demotion sees `_path === null`, gzip repair cannot race a reopen.  */
         this._job(async () => {
+            // disk-driven, audit-independent (runs even with audit:false)
             await this._sealOrphanedPastStamps();
             if (this._auditEnabled) {
                 this._demoteZombieActives();
@@ -252,7 +284,7 @@ export class RotateFileStream extends Writable {
                 this._aevent("boot", { stamp: this._curStamp, index: this._index });
                 this._saveAudit();
             }
-            if (this.maxFiles) this._retire();
+            if (this.maxFiles || this.maxTotalSize > 0) this._retire(); // budget policy also gates
         }).catch(() => { });
 
         this._armTimer();
@@ -321,6 +353,64 @@ export class RotateFileStream extends Writable {
      */
     advanceClock(): Promise<void> {
         return this._job(() => this._applyBump());
+    }
+
+    /**
+     * Every family file on disk, oldest stamp first.
+     * Disk is truth: untracked files are reported with state "untracked".
+     */
+    listSegments(): SegmentInfo[] {
+        const rx = new RegExp(
+            "^" + escRe(this._tL) + "(.+?)" + escRe(this._tMid) +
+            "(?:\\.(\\d+))?" + escRe(this._tExt) + "(?:\\.gz)?$",
+        );
+        const skip =
+            this._symlinkPath && path.basename(this._symlinkPath);
+        const out: SegmentInfo[] = [];
+        let names: string[] = [];
+        try {
+            names = fs.readdirSync(this.dir);
+        } catch {
+            return out;
+        }
+        for (const n of names) {
+            if (n === skip) continue;
+            const m = rx.exec(n);
+            if (!m) continue;
+            const rec = this._audit.files[n];
+            out.push({
+                file: path.join(this.dir, n),
+                stamp: m[1]!,
+                index: m[2] ? Number.parseInt(m[2], 10) : 0,
+                gzipped: n.endsWith(".gz"),
+                bytes: statSizeSafe(path.join(this.dir, n)),
+                state: rec?.state ?? "untracked",
+                openedAt: rec?.openedAt,
+                archivedAt: rec?.archivedAt,
+            });
+        }
+        out.sort(
+            (a, b) => a.stamp.localeCompare(b.stamp) || a.index - b.index,
+        );
+        return out;
+    }
+
+    /**
+     * Health-check snapshot for dashboards and support triage.
+     */
+    stats(): StreamStats {
+        const segs = this.listSegments();
+        return {
+            dir: this.dir,
+            currentStamp: this._curStamp,
+            activeFile: this._path,
+            activeIndex: this._index,
+            segments: segs.length,
+            archived: segs.filter((s) => s.gzipped).length,
+            totalBytes: segs.reduce((sum, s) => sum + s.bytes, 0),
+            clockOffsetMs: this._offsetMs,
+            symlink: this._symlinkPath,
+        };
     }
 
     /* ==================================================================
@@ -476,6 +566,61 @@ export class RotateFileStream extends Writable {
         return idx;
     }
 
+    /**
+     * Atomically flip the "current" symlink to the active segment.
+     * tmp + rename so followers (`tail -f`, Filebeat) never observe a gap.
+     * Relative target keeps the link portable. Best-effort: filesystems
+     * denying symlinks warn once and disable the feature permanently.
+     */
+    private _updateSymlink(): void {
+        const link = this._symlinkPath;
+        if (!link || !this._path) return;
+        const tmp = `${link}.tmp`;
+        try {
+            try { fs.unlinkSync(tmp); } catch { /* absent */ }
+            fs.symlinkSync(path.basename(this._path), tmp, "file");
+            fs.renameSync(tmp, link);
+        } catch (e) {
+            this._symlinkPath = null;
+            this.emit(
+                "warn",
+                new Error(
+                    `symlink unavailable ("${link}"): ${(e as Error).message} — continuing without it`,
+                ),
+            );
+        }
+    }
+
+    /**
+     * Await the user's onSeal hook with a hard timeout. Result or
+     * failure degrades to `warn` — a wedged upload must never stall rotation.
+     * Called BEFORE retention so uploads finish before deletion.
+     */
+    private async _runSealHook(raw: string, gz: string | null): Promise<void> {
+        const hook = this._onSeal;
+        if (!hook) return;
+        let timer: NodeJS.Timeout | undefined;
+        try {
+            await Promise.race([
+                Promise.resolve().then(() => hook({ raw, gz })),
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(
+                        () =>
+                            reject(new Error(
+                                `onSeal hook timed out after ${this._sealHookTimeoutMs}ms ` +
+                                `(${path.basename(gz ?? raw)})`,
+                            )),
+                        this._sealHookTimeoutMs,
+                    );
+                }),
+            ]);
+        } catch (err) {
+            this.emit("warn", err as Error);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
+
     private async _ensureOpen(): Promise<void> {
         if (this._ws) return;
         const p = this._resolveName(this._curStamp, this._index);
@@ -484,6 +629,7 @@ export class RotateFileStream extends Writable {
         ws.on("error", (e) => this.emit("error", e));
         this._ws = ws;
         this._path = p;
+        this._updateSymlink(); // flip pointer on every open
 
         if (this._auditEnabled) {
             const base = path.basename(p);
@@ -530,9 +676,15 @@ export class RotateFileStream extends Writable {
                     rec.bytes = realBytes;
                     this._saveAudit();
                 }
-                const ok = await gzipMove(oldPath, archive, (e) => this.emit("warn", e));
+                const ok = await gzipMove(
+                    oldPath,
+                    archive,
+                    (e) => this.emit("warn", e),
+                    this._compressionLevel,
+                );
                 if (ok) {
                     this._finishArchivedRecord(oldBase);
+                    await this._runSealHook(oldPath, archive);
                 } else {
                     if (rec) {
                         rec.gzipPending = false;
@@ -540,6 +692,7 @@ export class RotateFileStream extends Writable {
                     }
                     this._aevent("gzip-failed", { file: oldBase });
                     archive = null;
+                    await this._runSealHook(oldPath, null);
                 }
             } else if (realBytes === 0) {
                 // a concurrent writer may have archived this segment
@@ -549,6 +702,7 @@ export class RotateFileStream extends Writable {
                 if (existsSafe(adoptedGz)) {
                     this._finishArchivedRecord(oldBase);
                     archive = adoptedGz;
+                    await this._runSealHook(oldPath, adoptedGz);
                 } else {
                     try {
                         fs.unlinkSync(oldPath);
@@ -558,9 +712,13 @@ export class RotateFileStream extends Writable {
                     if (rec) delete this._audit.files[oldBase];
                     this._aevent("drop-empty", { file: oldBase });
                 }
-            } else if (rec) {
-                rec.state = "sealed";
-                rec.bytes = realBytes;
+            } else if (realBytes > 0) {
+                // uncompressed seal (zippedArchive off): still notify sealers
+                if (rec) {
+                    rec.state = "sealed";
+                    rec.bytes = realBytes;
+                }
+                await this._runSealHook(oldPath, null);
             }
         }
 
@@ -921,7 +1079,13 @@ export class RotateFileStream extends Writable {
             const full = path.join(this.dir, name);
             if (!existsSafe(full) || statSizeSafe(full) === 0) continue;
 
-            const ok = await gzipMove(full, `${full}.gz`, (e) => this.emit("warn", e));
+            const gzName = `${full}.gz`;
+            const ok = await gzipMove(
+                full,
+                gzName,
+                (e) => this.emit("warn", e),
+                this._compressionLevel,
+            );
             if (!ok) continue;
 
             if (this._auditEnabled && this._audit.files[name]) {
@@ -929,7 +1093,6 @@ export class RotateFileStream extends Writable {
                 this._finishArchivedRecord(name, true);
             } else {
                 // untracked → record it fresh so future reconciles see truth
-                const gzName = `${name}.gz`;
                 if (this._auditEnabled) {
                     this._audit.files[gzName] = {
                         state: "archived",
@@ -938,8 +1101,9 @@ export class RotateFileStream extends Writable {
                     };
                     this._aevent("seal-past", { file: gzName });
                 }
-                this.emit("archive", path.join(this.dir, gzName));
+                this.emit("archive", gzName);
             }
+            await this._runSealHook(full, gzName);
         }
     }
 
@@ -962,11 +1126,18 @@ export class RotateFileStream extends Writable {
                     /* ignore */
                 }
                 this._finishArchivedRecord(name, true);
+                await this._runSealHook(src, dst);
                 continue;
             }
-            const ok = await gzipMove(src, dst, (e) => this.emit("warn", e));
+            const ok = await gzipMove(
+                src,
+                dst,
+                (e) => this.emit("warn", e),
+                this._compressionLevel,
+            );
             if (ok) {
                 this._finishArchivedRecord(name, true);
+                await this._runSealHook(src, dst);
             } else {
                 rec.gzipPending = false;
                 rec.state = "kept-raw";
@@ -1001,7 +1172,7 @@ export class RotateFileStream extends Writable {
 
     private async _retire(): Promise<void> {
         const policy = this.maxFiles;
-        if (!policy) return;
+        if (!policy && this.maxTotalSize <= 0) return; // budget gates too
 
         const activeBase = this._path && path.basename(this._path);
         const activeStem = activeBase?.replace(/(?:\.\d+)?(?:\.log|)(?:\.gz)?$/, "");
@@ -1009,6 +1180,11 @@ export class RotateFileStream extends Writable {
             path.basename(this._auditPath),
             `${path.basename(this._auditPath)}.tmp`,
             `${path.basename(this._auditPath)}.corrupt`,
+            // never eat the "current" pointer (or its tmp)
+            ...(this._symlinkPath
+                ? [path.basename(this._symlinkPath),
+                `${path.basename(this._symlinkPath)}.tmp`]
+                : []),
         ];
 
         try {
@@ -1021,11 +1197,12 @@ export class RotateFileStream extends Writable {
                     !reserved.includes(n),
             );
 
-            const stats: { full: string; mtimeMs: number }[] = [];
+            const stats: { full: string; mtimeMs: number; size: number }[] = [];
             for (const name of candidates) {
                 const full = path.join(this.dir, name);
                 try {
-                    stats.push({ full, mtimeMs: (await fs.promises.stat(full)).mtimeMs });
+                    const st = await fs.promises.stat(full);
+                    stats.push({ full, mtimeMs: st.mtimeMs, size: st.size }); // size
                 } catch {
                     /* raced deletion */
                 }
@@ -1033,14 +1210,27 @@ export class RotateFileStream extends Writable {
             stats.sort((a, b) => a.mtimeMs - b.mtimeMs); // oldest first
 
             const kill = new Set<string>();
-            if (policy.days != null) {
+            if (policy?.days != null) {
                 const cutoff = this._now() - policy.days * 86_400_000;
                 for (const f of stats) if (f.mtimeMs < cutoff) kill.add(f.full);
             }
-            if (policy.count != null) {
+            if (policy?.count != null) {
                 const survivors = stats.filter((f) => !kill.has(f.full));
                 const excessCount = survivors.length - policy.count;
                 for (let i = 0; i < excessCount; i++) kill.add(survivors[i].full);
+            }
+
+            // byte budget — delete OLDEST until under budget.
+            // The active segment is never a candidate, so only archives count.
+            if (this.maxTotalSize > 0) {
+                const survivors = stats.filter((f) => !kill.has(f.full)); // oldest→newest
+                let total = survivors.reduce((sum, f) => sum + f.size, 0);
+                let i = 0;
+                while (total > this.maxTotalSize && i < survivors.length) {
+                    kill.add(survivors[i].full);
+                    total -= survivors[i].size;
+                    i++;
+                }
             }
 
             if (kill.size === 0) return;

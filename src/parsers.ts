@@ -5,31 +5,63 @@ export interface ParsedMaxFiles {
     days?: number;
     count?: number;
 }
+
 export type ParsedFrequency =
     | { readonly type: "daily" }
     | { readonly type: "interval"; ms: number };
 
 const UNITS: Record<string, number> = {
-    b: 1, k: 1024, kb: 1024,
-    m: 1048576, mb: 1048576,
-    g: 1073741824, gb: 1073741824,
+    b: 1,
+    k: 1024,
+    kb: 1024,
+    m: 1048576,
+    mb: 1048576,
+    g: 1073741824,
+    gb: 1073741824,
 };
 
-const FREQ_MULT: Record<string, number> = {
-    ms: 1, s: 1000, m: 60_000, h: 3_600_000,
+/**
+ * Every unit token the duration regex can capture MUST have an entry here —
+ * a captured-but-unmapped unit would otherwise surface as a NaN that
+ * detonates later (e.g. `RangeError: Invalid time value` from Intl),
+ * far away from the actual misconfiguration.
+ */
+const DURATION_ALIASES: Record<string, number> = {
+    ms: 1,
+    s: 1_000,
+    m: 60_000,
+    h: 3_600_000,
+    hour: 3_600_000,
+    hours: 3_600_000,
 };
 
+type DurationUnit = keyof typeof DURATION_ALIASES;
+
+/**
+ * Parse `"<n><unit?>"` or a bare number into milliseconds.
+ * Bare numbers are interpreted in `defaultUnit`.
+ *
+ * Accepted unit spellings: ms, s, m, h, hour, hours (case-insensitive).
+ */
 function parseDuration(
     value: number | string,
-    defaultUnit: keyof typeof FREQ_MULT,
+    defaultUnit: DurationUnit,
     fieldName: string,
 ): number {
     if (typeof value === "number") {
-        return Math.round(value * FREQ_MULT[defaultUnit]);
+        return Math.round(value * DURATION_ALIASES[defaultUnit]);
     }
-    const m = /^\s*(-?\d+(?:\.\d+)?)\s*(ms|s|m|h)?\s*$/i.exec(value);
+
+    const m =
+        /^\s*(-?\d+(?:\.\d+)?)\s*(h(?:our)?s?|ms|s|m)?\s*$/i.exec(value);
     if (!m) throw new Error(`Invalid ${fieldName} "${value}"`);
-    return Math.round(Number.parseFloat(m[1]) * FREQ_MULT[(m[2] ?? defaultUnit).toLowerCase()],);
+
+    const unit = (m[2] ?? defaultUnit).toLowerCase();
+    const mult = DURATION_ALIASES[unit];
+    if (mult === undefined) {
+        throw new Error(`Invalid ${fieldName} unit "${m[2]}" in "${value}"`);
+    }
+    return Math.round(Number.parseFloat(m[1]) * mult);
 }
 
 export function parseSize(v: RotateFileStreamOptions["maxSize"]): number {
@@ -37,14 +69,18 @@ export function parseSize(v: RotateFileStreamOptions["maxSize"]): number {
     if (typeof v === "number") return v;
     const m = /^\s*(\d+(?:\.\d+)?)\s*(b|kb|k|mb|m|gb|g)?\s*$/i.exec(v);
     if (!m) throw new Error(`Invalid maxSize "${v}"`);
-    return Math.round(Number.parseFloat(m[1]) * (UNITS[m[2]?.toLowerCase()] ?? 1));
+    return Math.round(
+        Number.parseFloat(m[1]) * (UNITS[m[2]?.toLowerCase()] ?? 1),);
 }
 
 export function parseMaxFiles(
     v: RotateFileStreamOptions["maxFiles"],
 ): ParsedMaxFiles | null {
     if (v === undefined || v === null || v === "" || v === 0) return null;
-    if (typeof v === "number") return { count: v };
+    if (typeof v === "number") {
+        if (v < 0) throw new Error(`Invalid maxFiles "${v}"`);
+        return { count: v };
+    }
     const m = /^\s*(\d+)\s*d\s*$/i.exec(v);
     if (m) return { days: Number.parseInt(m[1], 10) };
     const n = /^\s*(\d+)\s*$/.exec(v);
@@ -66,6 +102,14 @@ export function parseFrequency(
     return { type: "interval", ms: Number.parseInt(m[1], 10) * FREQ_MULT[m[2].toLowerCase()] };
 }
 
+const FREQ_MULT: Record<string, number> = {
+    ms: 1,
+    s: 1_000,
+    m: 60_000,
+    h: 3_600_000,
+};
+
+/** Static virtual-clock shift. Accepts hours by default; h/hours/m/s/ms. */
 export function parseClockOffset(
     v: RotateFileStreamOptions["addHours"],
 ): number {
@@ -73,9 +117,10 @@ export function parseClockOffset(
     return parseDuration(v, "h", "addHours");
 }
 
+/** Per-tick virtual-clock step. Accepts hours by default; h/hours/m/s/ms. */
 export function parseClockStep(
     v: RotateFileStreamOptions["addHoursEveryMin"],
 ): number {
     if (v === undefined || v === null || v === "") return 0;
-    return parseDuration(v, "h", "addHours");
+    return parseDuration(v, "h", "addHoursEveryMin");
 }
