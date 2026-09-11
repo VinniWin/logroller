@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1] — 2026-09-12
+
+### Changed
+- Production bundles are now minified with @rollup/plugin-terser.
+- Terser is configured to optimize top-level code and remove console calls and debugger statements from distributed builds.
+- Production bundles target ECMAScript 2025 for modern Node.js runtimes.
+- Bundled ESM and CJS files now include a generated package banner containing the package name, version, and license.
+- CHANGELOG.md is no longer included in the published npm package, keeping the package contents focused on runtime files and essential documentation.
+
+
 ## [2.1.0] — 2026-08-28
 
 ### Added
