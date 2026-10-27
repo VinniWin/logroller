@@ -19,7 +19,8 @@ import {
     getDtf,
     nextAligned,
     nextMidnight,
-    partsIn
+    partsIn,
+    stampRe,
 } from "./time.js";
 import type {
     RotateFileStreamEventMap,
@@ -163,9 +164,12 @@ export class RotateFileStream extends Writable {
     private _bytes = 0;
     private _timer: NodeJS.Timeout | null = null;
     private _bumpTimer: NodeJS.Timeout | null = null;
+    private _beatTimer: NodeJS.Timeout | undefined;
     private _ended = false;
     private _tail: Promise<unknown> = Promise.resolve();
     private _warnedBackward = false;
+    private _stampSec = Number.NaN;
+    private _stampVal = "";
     private _audit: AuditDoc;
 
     constructor(opts: Partial<RotateFileStreamOptions> = {}) {
@@ -214,7 +218,7 @@ export class RotateFileStream extends Writable {
                 escRe(this._tL) + stampSrc + escRe(this._tMid) +
                 "(?:\\.(\\d+))?" + escRe(this._tExt) + "(?:\\.gz)?$",
             );
-        this._rxActive = this._rxFor("[^.]+");
+        this._rxActive = this._rxFor(stampRe(this.datePattern));
 
         this._auditEnabled = opts.audit !== false;
         const stem = (this._tL.replace(/[^\w.-]+/g, "") || "log")
@@ -284,14 +288,23 @@ export class RotateFileStream extends Writable {
                 this._aevent("boot", { stamp: this._curStamp, index: this._index });
                 this._saveAudit();
             }
-            if (this.maxFiles || this.maxTotalSize > 0) this._retire(); // budget policy also gates
+            await this._retire();
         }).catch(() => { });
 
         this._armTimer();
         this._armBump();
+        if (this._auditEnabled) {
+            // keep writer.heartbeat fresh so a second process can detect us while idle
+            this._beatTimer = setInterval(
+                () => this._job(() => this._saveAudit()).catch(() => { }),
+                HEARTBEAT_STALE_MS / 3,
+            );
+            this._beatTimer.unref();
+        }
         this.once("close", () => {
             this._stopTimer();
             this._stopBump();
+            clearInterval(this._beatTimer);
         });
     }
 
@@ -360,10 +373,7 @@ export class RotateFileStream extends Writable {
      * Disk is truth: untracked files are reported with state "untracked".
      */
     listSegments(): SegmentInfo[] {
-        const rx = new RegExp(
-            "^" + escRe(this._tL) + "(.+?)" + escRe(this._tMid) +
-            "(?:\\.(\\d+))?" + escRe(this._tExt) + "(?:\\.gz)?$",
-        );
+        const rx = this._rxActive;
         const skip =
             this._symlinkPath && path.basename(this._symlinkPath);
         const out: SegmentInfo[] = [];
@@ -419,14 +429,25 @@ export class RotateFileStream extends Writable {
 
     public override _write(
         chunk: Buffer,
-        encoding: BufferEncoding,
+        _encoding: BufferEncoding,
         callback: (error?: Error | null) => void,
     ): void {
+        this._writeBatch([chunk], callback);
+    }
+
+    /** Lines buffered while the previous write was in flight arrive here as one batch. */
+    public override _writev(
+        chunks: { chunk: Buffer; encoding: BufferEncoding }[],
+        callback: (error?: Error | null) => void,
+    ): void {
+        this._writeBatch(chunks.map((c) => c.chunk), callback);
+    }
+
+    private _writeBatch(chunks: Buffer[], callback: (error?: Error | null) => void): void {
         if (this._ended) {
             process.nextTick(callback, new Error("write after end"));
             return;
         }
-        const len = chunk.length;
 
         this._job(async () => {
             try {
@@ -435,34 +456,45 @@ export class RotateFileStream extends Writable {
 
                 await this._ensureOpen();
 
-                if (
-                    this.maxSize > 0 &&
-                    this._bytes > 0 &&
-                    this._bytes + len > this.maxSize
-                ) {
-                    await this._rotate("size");
-                    await this._ensureOpen();
+                // group chunks per segment so maxSize still splits on chunk boundaries
+                let group: Buffer[] = [];
+                let groupLen = 0;
+                for (const c of chunks) {
+                    const cur = this._bytes + groupLen;
+                    if (this.maxSize > 0 && cur > 0 && cur + c.length > this.maxSize) {
+                        await this._flush(group, groupLen);
+                        group = [];
+                        groupLen = 0;
+                        await this._rotate("size");
+                        await this._ensureOpen();
+                    }
+                    group.push(c);
+                    groupLen += c.length;
                 }
-
-                const ws = this._ws;
-                if (!ws) throw new Error("segment write stream not open");
-
-                await new Promise<void>((resolve, reject) =>
-                    ws.write(chunk, encoding, (e) => (e ? reject(e) : resolve())),
-                );
-                this._bytes += len;
+                await this._flush(group, groupLen);
                 callback();
             } catch (err) {
-                this.emit("error", err as Error);
-                callback(err as Error);
+                callback(err as Error); // Writable emits 'error' once from here
             }
         }).catch(() => { });
+    }
+
+    private async _flush(group: Buffer[], len: number): Promise<void> {
+        if (!len) return;
+        const ws = this._ws;
+        if (!ws) throw new Error("segment write stream not open");
+        const buf = group.length === 1 ? group[0] : Buffer.concat(group, len);
+        await new Promise<void>((resolve, reject) =>
+            ws.write(buf, (e) => (e ? reject(e) : resolve())),
+        );
+        this._bytes += len;
     }
 
     public override _final(callback: (error?: Error | null) => void): void {
         this._ended = true;
         this._stopTimer();
         this._stopBump();
+        clearInterval(this._beatTimer);
         this._job(async () => {
             await endStream(this._ws);
             const base = this._path && path.basename(this._path);
@@ -481,10 +513,26 @@ export class RotateFileStream extends Writable {
             .finally(() => callback());
     }
 
-    public override destroy(...args: Parameters<Writable["destroy"]>): this {
+    public override _destroy(
+        err: Error | null,
+        callback: (error?: Error | null) => void,
+    ): void {
+        this._ended = true;
         this._stopTimer();
         this._stopBump();
-        return super.destroy(...args);
+        clearInterval(this._beatTimer);
+        this._ws?.destroy(); // release the fd (Windows keeps open files locked)
+        this._ws = null;
+        callback(err);
+    }
+
+    /**
+     * `await using log = createStream(...)` — ends (flushes) the stream on scope exit.
+     * Node's default destroys instead, dropping buffered lines.
+     */
+    override async [Symbol.asyncDispose](): Promise<void> {
+        if (this.destroyed || this.writableFinished) return;
+        await new Promise<void>((res) => this.end(() => res()));
     }
 
     /* ==================================================================
@@ -502,16 +550,22 @@ export class RotateFileStream extends Writable {
         return Date.now() + this._offsetMs;
     }
 
-    private _stampNow(d: Date = new Date(this._now())): string {
-        return formatStamp(this.datePattern, partsIn(this.tz, d));
+    /** Stamps change at most once per second (ss is the finest token), so cache per second. */
+    private _stampNow(): string {
+        const sec = Math.floor(this._now() / 1000);
+        if (sec !== this._stampSec) {
+            this._stampSec = sec;
+            this._stampVal = formatStamp(this.datePattern, partsIn(this.tz, new Date(sec * 1000)));
+        }
+        return this._stampVal;
     }
 
     private _resolveName(stamp: string, index: number): string {
-        const base = path.join(this.dir, this._tL + stamp + this._tMid + this._tExt);
-        if (!index) return base;
-        return /\.[^.]+$/.test(base)
-            ? base.replace(/\.[^.]+$/, `.${index}$&`)
-            : `${base}.${index}`;
+        // mirrors _rxFor: prefix + stamp + mid + [.N] + ext
+        return path.join(
+            this.dir,
+            this._tL + stamp + this._tMid + (index ? `.${index}` : "") + this._tExt,
+        );
     }
 
     /**
@@ -626,7 +680,7 @@ export class RotateFileStream extends Writable {
         const p = this._resolveName(this._curStamp, this._index);
         this._bytes = statSizeSafe(p);
         const ws = fs.createWriteStream(p, { flags: "a" });
-        ws.on("error", (e) => this.emit("error", e));
+        ws.on("error", (e) => this.destroy(e)); // deduped by Writable's errored state
         this._ws = ws;
         this._path = p;
         this._updateSymlink(); // flip pointer on every open
@@ -764,7 +818,7 @@ export class RotateFileStream extends Writable {
             });
         }
 
-        this._retire();
+        await this._retire();
     }
 
     /* ==================================================================
@@ -800,21 +854,8 @@ export class RotateFileStream extends Writable {
                         /* interval rotation is schedule-based; runs regardless of
                            stamp movement */
                         if (this._hasContent()) await this._rotate("time");
-                    } else if (this._stampAdvanced(stamp)) {
-                        // guarded daily branch
-                        if (this._hasContent()) {
-                            await this._rotate("time");
-                        } else {
-                            /* idle boundary slide — no file created for empty days */
-                            this._curStamp = stamp;
-                            this._index = this._recoverIndexFor(stamp);
-                            if (this._auditEnabled) {
-                                this._setActivePointer(this._index);
-                                this._aevent("period", { stamp });
-                                this._saveAudit();
-                            }
-                            this.emit("period", stamp);
-                        }
+                    } else {
+                        await this._crossPeriod(stamp);
                     }
                     /* stamp regressed or unchanged → keep current segment, re-arm */
 
@@ -824,6 +865,23 @@ export class RotateFileStream extends Writable {
             delay,
         );
         if (this.unrefTimers) this._timer.unref();
+    }
+
+    /** Guarded period crossing: rotate if the segment has data, else slide with no file. */
+    private async _crossPeriod(stamp: string, virtual = false): Promise<void> {
+        if (!this._stampAdvanced(stamp)) return;
+        if (this._hasContent()) {
+            await this._rotate("time");
+            return;
+        }
+        this._curStamp = stamp;
+        this._index = this._recoverIndexFor(stamp);
+        if (this._auditEnabled) {
+            this._setActivePointer(this._index);
+            this._aevent("period", virtual ? { stamp, virtual } : { stamp });
+            this._saveAudit();
+        }
+        this.emit("period", stamp);
     }
 
     private _armBump(): void {
@@ -849,20 +907,7 @@ export class RotateFileStream extends Writable {
         this._armTimer();
 
         const stamp = this._stampNow();
-        // guarded crossing (virtual clock can't roll backward either)
-        if (this._stampAdvanced(stamp)) {
-            if (this._hasContent()) {
-                await this._rotate("time");
-            } else {
-                this._curStamp = stamp;
-                this._index = this._recoverIndexFor(stamp);
-                if (this._auditEnabled) {
-                    this._setActivePointer(this._index);
-                    this._aevent("period", { stamp, virtual: true });
-                }
-                this.emit("period", stamp);
-            }
-        }
+        await this._crossPeriod(stamp, true);
         if (this._auditEnabled) {
             this._aevent("clock-step", {
                 addedMsPerMin: this._stepMs,
@@ -1055,10 +1100,7 @@ export class RotateFileStream extends Writable {
     private async _sealOrphanedPastStamps(): Promise<void> {
         if (!this.zippedArchive) return;
 
-        const stampRx = new RegExp(
-            "^" + escRe(this._tL) + "(.+?)" + escRe(this._tMid) +
-            "(?:\\.\\d+)?" + escRe(this._tExt) + "(?:\\.gz)?$",
-        );
+        const stampRx = this._rxActive;
 
         let names: string[] = [];
         try {
@@ -1174,8 +1216,8 @@ export class RotateFileStream extends Writable {
         const policy = this.maxFiles;
         if (!policy && this.maxTotalSize <= 0) return; // budget gates too
 
-        const activeBase = this._path && path.basename(this._path);
-        const activeStem = activeBase?.replace(/(?:\.\d+)?(?:\.log|)(?:\.gz)?$/, "");
+        // _path is null mid-rotation, so name the slot about to be written explicitly
+        const activeBase = path.basename(this._resolveName(this._curStamp, this._index));
         const reserved = [
             path.basename(this._auditPath),
             `${path.basename(this._auditPath)}.tmp`,
@@ -1193,7 +1235,6 @@ export class RotateFileStream extends Writable {
                 (n) =>
                     this._rxActive.test(n) &&
                     n !== activeBase &&
-                    !(activeStem && n.startsWith(activeStem)) &&
                     !reserved.includes(n),
             );
 

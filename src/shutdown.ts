@@ -2,7 +2,7 @@ import type { RotateFileStream } from "./rotate-file-stream.js";
 
 const registry = new Set<RotateFileStream>();
 let installed = false;
-let inProgress = false;
+let inProgress: Promise<boolean> | null = null;
 
 export interface ShutdownOptions {
     /** Signals to listen on. @default ["SIGINT", "SIGTERM"] */
@@ -42,7 +42,7 @@ export function installShutdown(
         const code = opts.code ?? 0;
         for (const sig of opts.signals ?? (["SIGINT", "SIGTERM"] as NodeJS.Signals[])) {
             process.on(sig, () => {
-                void flushAll(timeoutMs).finally(() => process.exit(code));
+                void flushAll(timeoutMs).then((clean) => process.exit(clean ? code : 1));
             });
         }
     }
@@ -57,22 +57,33 @@ export function installShutdown(
 
 /**
  * End every registered stream (flush buffered writes) with a deadline.
- * Does NOT exit the process. Double-ending an already-ended stream is
- * harmless — the error lands in the ignored callback.
+ * Does NOT exit the process. Resolves `true` when every stream finished,
+ * `false` when the deadline hit first. Concurrent calls share one flush.
+ * Ended/destroyed streams leave the registry.
  */
-export async function flushAll(timeoutMs = 5_000): Promise<void> {
-    if (inProgress) return;
-    inProgress = true;
-    const deadline = setTimeout(() => process.exit(1), timeoutMs);
-    deadline.unref();
-    try {
-        await Promise.allSettled(
-            [...registry].map(
-                (s) => new Promise<void>((res) => s.end(() => res())),
-            ),
-        );
-    } finally {
-        clearTimeout(deadline);
-        inProgress = false;
-    }
+export function flushAll(timeoutMs = 5_000): Promise<boolean> {
+    inProgress ??= (async () => {
+        let deadline: NodeJS.Timeout | undefined;
+        try {
+            const ended = Promise.allSettled(
+                [...registry].map(
+                    (s) => new Promise<void>((res) => {
+                        s.once("close", res);
+                        s.end(() => res());
+                        if (s.destroyed) res();
+                    }),
+                ),
+            ).then(() => true);
+            const timedOut = new Promise<boolean>((res) => {
+                deadline = setTimeout(() => res(false), timeoutMs);
+                deadline.unref();
+            });
+            return await Promise.race([ended, timedOut]);
+        } finally {
+            clearTimeout(deadline);
+            for (const s of registry) if (s.writableFinished || s.destroyed) registry.delete(s);
+            inProgress = null;
+        }
+    })();
+    return inProgress;
 }

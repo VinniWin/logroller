@@ -104,6 +104,27 @@ const logger = pino(
 );
 ```
 
+### pino transport (worker thread)
+
+```js
+const logger = pino({
+  transport: {
+    target: "logroller/pino",
+    options: { filename: "logs/app-%DATE%.log", maxSize: "20m", zippedArchive: true },
+  },
+});
+```
+
+### `await using`
+
+```ts
+await using log = createStream({ filename: "logs/job-%DATE%.log" });
+log.write("done\n"); // flushed and closed when the scope exits
+```
+
+Node's default `Writable` dispose destroys the stream (dropping buffered
+lines); logroller overrides it to `end()` gracefully.
+
 ## What lands on disk
 
 Example snapshot for `filename: "logs/app-%DATE%.log"` on **Aug 28**, with
@@ -213,8 +234,9 @@ installShutdown(log); // SIGINT + SIGTERM → end() → exit 0
   installs process listeners once; streams accumulate in a registry.
 - On signal: every registered stream is ended (buffered writes flushed,
   audit manifest finalized), with a hard `timeoutMs` deadline (default 5 s).
-- `flushAll()` is the same graceful end **without exiting** — for tests and
-  custom signal handling.
+- `flushAll(timeoutMs?)` is the same graceful end **without exiting** — for
+  tests and custom signal handling. It resolves `true` when every stream
+  finished, `false` if the deadline hit first; concurrent calls share one flush.
 
 ## Introspection
 
@@ -243,7 +265,7 @@ maxFiles: "30d",
 maxTotalSize: "2g",  // combined: either policy may delete
 ```
 
-Unset means files live forever until you delete them. The active segment is
+Unset, `0`, `"0"` or `"0d"` means files live forever until you delete them. The active segment is
 never a retention candidate, and the audit/symlink files are always reserved.
 
 ## API
@@ -287,7 +309,7 @@ never a retention candidate, and the audit/symlink files are always reserved.
 | Function                          | Purpose                                                      |
 | --------------------------------- | ------------------------------------------------------------ |
 | `installShutdown(streams, opts?)` | register streams for SIGINT/SIGTERM flush; returns `flush()` |
-| `flushAll(timeoutMs?)`            | gracefully end all registered streams, no exit               |
+| `flushAll(timeoutMs?)`            | end all registered streams, no exit; `Promise<boolean>`      |
 
 ### Events (typed)
 
@@ -374,7 +396,9 @@ Pure Node APIs; path handling via `node:path`. All three supported
 
 ## Contributing
 
-PRs welcome. `npm run verify` gates every change (lint + typecheck + tests).
+PRs welcome. `npm run verify` gates every change (typecheck + tests), and CI
+runs it on Linux, macOS and Windows × Node 22/24, plus a runtime smoke test
+on Node 16/18/20. (Building and the full test suite need Node 22.6+.)
 Please file issues before large refactors.
 
 ## License

@@ -39,9 +39,24 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.esm.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.esm.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./pino": {
+      "import": {
+        "types": "./dist/pino.d.ts",
+        "default": "./dist/pino.esm.js"
+      },
+      "require": {
+        "types": "./dist/pino.d.cts",
+        "default": "./dist/pino.cjs"
+      }
     },
     "./package.json": "./package.json"
   },
@@ -55,13 +70,14 @@
   },
   "sideEffects": false,
   "scripts": {
-    "build": "tsc -p tsconfig.json && rollup -c",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && rollup -c",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.js\"",
-    "test": "npm run build && node --test --experimental-strip-types test/rotate.test.ts test/features.test.ts",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+    "test": "npm run build && node --test --experimental-strip-types test/rotate.test.ts test/features.test.ts test/fixes.test.ts && node test/smoke.cjs",
     "verify": "npm run typecheck && npm test",
     "prepublishOnly": "npm run verify",
-    "release": "npm run verify && npm pack --dry-run"
+    "release": "npm run verify && npm pack --dry-run",
+    "check:types": "npx --yes @arethetypeswrong/cli --pack ."
   },
   "devDependencies": {
     "@rollup/plugin-terser": "^1.0.0",
@@ -69,6 +85,7 @@
     "@types/node": "^26.4.0",
     "prettier": "^3.4.2",
     "rollup": "^4.28.1",
+    "rollup-plugin-dts": "^6.5.1",
     "tslib": "^2.8.1",
     "typescript": "^5.7.2"
   }

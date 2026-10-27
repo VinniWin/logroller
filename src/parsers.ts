@@ -82,9 +82,10 @@ export function parseMaxFiles(
         return { count: v };
     }
     const m = /^\s*(\d+)\s*d\s*$/i.exec(v);
-    if (m) return { days: Number.parseInt(m[1], 10) };
+    if (m) return Number(m[1]) === 0 ? null : { days: Number.parseInt(m[1], 10) };
     const n = /^\s*(\d+)\s*$/.exec(v);
-    if (n) return { count: Number.parseInt(n[1], 10) };
+    // "0" (e.g. from an env var) means unlimited, same as the number 0
+    if (n) return Number(n[1]) === 0 ? null : { count: Number.parseInt(n[1], 10) };
     throw new Error(`Invalid maxFiles "${v}"`);
 }
 

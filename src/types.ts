@@ -42,7 +42,7 @@ export interface RotateFileStreamOptions {
      * Retention by age or count:
      * - `"90d"` — delete archived files older than 90 days (mtime)
      * - `500`   — keep at most the newest 500 archived files
-     * Unset means never auto-delete.
+     * Unset, `0`, `"0"` or `"0d"` means never auto-delete.
      */
     maxFiles?: number | string;
 

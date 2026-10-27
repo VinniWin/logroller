@@ -5,6 +5,44 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 3.0.0
+
+### Breaking
+
+- `flushAll()` no longer calls `process.exit(1)` on timeout; it resolves
+  `false` instead. Only the `installShutdown` signal handler exits (code 1
+  when the deadline hit).
+- Retention only matches files whose stamp fits the configured `datePattern`
+  exactly; files from an older pattern are no longer auto-deleted.
+
+### Added
+
+- `logroller/pino` entry: `transport: { target: "logroller/pino", options }`.
+- `Symbol.asyncDispose`: `await using log = createStream(...)` flushes on
+  scope exit (Node's default would destroy and drop buffered lines). Needs Node 18.18+/20.4+; on older Node the method is simply absent.
+- `flushAll()` returns `Promise<boolean>`; concurrent calls share one flush.
+- Correct CommonJS types (`index.d.cts`); declarations are bundled per entry.
+- CI on Linux/macOS/Windows × Node 22/24, a runtime smoke test on Node 16/18/20, and a provenance-signed release workflow.
+
+### Fixed
+
+- Size rotation with a dotted directory and no file extension
+  (`logs.d/app-%DATE%`) wrote into a non-existent `logs.1.d/` folder.
+- Dotted `datePattern`s (`YYYY.MM.DD`) confused segment index and stamp.
+- One write failure emitted `error` three times; with no listener the
+  stream could stop calling write callbacks.
+- Retention ran outside the serial queue, and its active-segment guard never fired.
+- `maxFiles: "0"` (e.g. from an env var) deleted every archive; `"0"` and
+  `"0d"` now mean unlimited, like `0`.
+- `destroy()` left the segment file open (locked on Windows).
+- The writer heartbeat is refreshed while idle, so concurrent-writer
+  detection works for processes that rarely rotate.
+
+### Performance
+
+- Buffered lines are written in batches (`_writev`) and the date stamp is
+  cached per second: 100k lines in ~85 ms instead of ~12 s.
+
 ## [2.1.1] — 2026-09-12
 
 ### Changed

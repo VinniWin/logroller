@@ -37,6 +37,14 @@ export function escRe(s: string): string {
     return s.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 }
 
+/** Capturing RegExp source matching exactly the stamps `pattern` produces. */
+export function stampRe(pattern: string): string {
+    return "(" + pattern
+        .split(/(YYYY|YY|MM|DD|HH|mm|ss)/)
+        .map((s, i) => (i % 2 ? (s === "YYYY" ? "\\d{4}" : "\\d{2}") : escRe(s)))
+        .join("") + ")";
+}
+
 /** Substitute YYYY|YY|MM|DD|HH|mm|ss tokens in `pattern`. */
 export function formatStamp(
     pattern: string,
